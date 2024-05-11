@@ -1,0 +1,59 @@
+package main
+
+import (
+	"context"
+	"fmt"
+	"go_srvs/user_srv/proto"
+	"google.golang.org/grpc"
+)
+
+var userClient proto.UserClient
+var conn *grpc.ClientConn
+
+func Init() {
+	var err error
+	conn, err = grpc.Dial("127.0.0.1:50051", grpc.WithInsecure())
+	if err != nil {
+		panic(err)
+	}
+	userClient = proto.NewUserClient(conn)
+}
+func TestGetUserList() {
+	rsp, err := userClient.GetUserList(context.Background(), &proto.PageInfo{
+		Pn:    1,
+		PSize: 5,
+	})
+	if err != nil {
+		panic(err)
+	}
+	for _, user := range rsp.Data {
+		println(user.Mobile, user.NickName, user.PassWord)
+		checkRsp, err := userClient.CheckPassWord(context.Background(), &proto.PasswordCheckInfo{
+			Password:          "admin123",
+			EncryptedPassword: user.PassWord,
+		})
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(checkRsp.Success)
+	}
+}
+func TestCreateUser() {
+	for i := 50; i < 52; i++ {
+		rsp, err := userClient.CreateUser(context.Background(), &proto.CreateUserInfo{
+			NickName: fmt.Sprintf("user%d", i),
+			PassWord: "admin123",
+			Mobile:   fmt.Sprintf("138000000%d", i),
+		})
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println(rsp.Id)
+	}
+}
+func main() {
+	Init()
+	//TestCreateUser()
+	TestGetUserList()
+	conn.Close()
+}
