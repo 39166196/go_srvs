@@ -2,16 +2,21 @@ package handler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"github.com/apache/rocketmq-client-go/v2/consumer"
+	"github.com/apache/rocketmq-client-go/v2/primitive"
 	"github.com/go-redsync/redsync/v4"
 	"github.com/go-redsync/redsync/v4/redis/goredis/v9"
 	goredislib "github.com/redis/go-redis/v9"
+	"go.uber.org/zap"
 	"go_srvs/inventory_srv/global"
 	"go_srvs/inventory_srv/model"
 	"go_srvs/inventory_srv/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
+	"gorm.io/gorm"
 	"sync"
 )
 
@@ -47,7 +52,18 @@ func (*InventoryServer) Sell(ctx context.Context, req *proto.SellInfo) (*emptypb
 	pool := goredis.NewPool(client)
 	rs := redsync.New(pool)
 	tx := global.DB.Begin()
+
+	sellDetail := model.StockSellDetail{
+		OrderSn: req.OrderSn,
+		Status:  1,
+	}
+	var details []model.GoodsDetail
 	for _, goodInfo := range req.GoodsInfo {
+		details = append(details, model.GoodsDetail{
+			Goods: goodInfo.GoodsId,
+			Num:   goodInfo.Num,
+		})
+
 		var inv model.Inventory
 
 		mutex := rs.NewMutex(fmt.Sprintf("goods_%d", goodInfo.GoodsId))
@@ -68,6 +84,12 @@ func (*InventoryServer) Sell(ctx context.Context, req *proto.SellInfo) (*emptypb
 		if ok, err := mutex.Unlock(); !ok || err != nil {
 			return nil, status.Errorf(codes.Internal, "释放redis分布式锁异常")
 		}
+
+	}
+	sellDetail.Detail = details
+	if result := tx.Create(&sellDetail); result.RowsAffected == 0 {
+		tx.Rollback()
+		return nil, status.Errorf(codes.Internal, "保存库存扣减历史失败")
 
 	}
 	tx.Commit()
@@ -93,4 +115,34 @@ func (*InventoryServer) Reback(ctx context.Context, req *proto.SellInfo) (*empty
 	tx.Commit()
 	m.Unlock()
 	return &emptypb.Empty{}, nil
+}
+func AutoReback(ctx context.Context, msgs ...*primitive.MessageExt) (consumer.ConsumeResult, error) {
+	type OrderInfo struct {
+		OrderSn string
+	}
+	for i := range msgs {
+		var orderInfo OrderInfo
+		if err := json.Unmarshal(msgs[i].Body, &orderInfo); err != nil {
+			zap.S().Errorf("解析json失败:%v\n", msgs[i].Body)
+			return consumer.ConsumeSuccess, nil
+		}
+		tx := global.DB.Begin()
+		var sellDetail model.StockSellDetail
+		if result := tx.Model(&model.StockSellDetail{}).Where(&model.StockSellDetail{OrderSn: orderInfo.OrderSn, Status: 1}).First(&sellDetail); result.RowsAffected == 0 {
+			return consumer.ConsumeSuccess, nil
+		}
+		for _, orderGood := range sellDetail.Detail {
+			if result := tx.Model(&model.Inventory{}).Where(&model.Inventory{Goods: orderGood.Goods}).Update("stocks", gorm.Expr("stocks + ?", orderGood.Num)); result.RowsAffected == 0 {
+				tx.Rollback()
+				return consumer.ConsumeRetryLater, nil
+			}
+		}
+		if result := tx.Model(&model.StockSellDetail{}).Where(&model.StockSellDetail{OrderSn: orderInfo.OrderSn}).Update("status", 2); result.RowsAffected == 0 {
+			tx.Rollback()
+			return consumer.ConsumeRetryLater, nil
+		}
+		tx.Commit()
+		return consumer.ConsumeSuccess, nil
+	}
+	return consumer.ConsumeSuccess, nil
 }

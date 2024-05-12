@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/md5"
 	"encoding/hex"
+	"fmt"
 	"go_srvs/inventory_srv/model"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
@@ -41,6 +42,15 @@ func main() {
 		panic("failed to connect database")
 	}
 
-	_ = db.AutoMigrate(&model.Inventory{})
-
+	//_ = db.AutoMigrate(&model.Inventory{}, &model.StockSellDetail{})
+	//orderDetail := model.StockSellDetail{
+	//	OrderSn: "qiwjsiqjowi",
+	//	Status:  1,
+	//	Detail:  []model.GoodsDetail{{1, 2}, {2, 3}},
+	//}
+	//db.Create(&orderDetail)
+	//取数据
+	var orderDetail model.StockSellDetail
+	db.Where(model.StockSellDetail{OrderSn: "qiwjsiqjowi"}).First(&orderDetail)
+	fmt.Println(orderDetail.Detail)
 }
