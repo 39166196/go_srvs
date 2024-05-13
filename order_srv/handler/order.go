@@ -8,6 +8,7 @@ import (
 	"github.com/apache/rocketmq-client-go/v2/consumer"
 	"github.com/apache/rocketmq-client-go/v2/primitive"
 	"github.com/apache/rocketmq-client-go/v2/producer"
+	"github.com/opentracing/opentracing-go"
 	"go.uber.org/zap"
 	"go_srvs/order_srv/global"
 	"go_srvs/order_srv/model"
@@ -147,32 +148,39 @@ type OrderListener struct {
 	Detail      string
 	ID          int32
 	OrderAmount float32
+	Ctx         context.Context
 }
 
 func (o *OrderListener) ExecuteLocalTransaction(msg *primitive.Message) primitive.LocalTransactionState {
 	var orderInfo model.OrderInfo
 	_ = json.Unmarshal(msg.Body, &orderInfo)
+	parentSpan := opentracing.SpanFromContext(o.Ctx)
 
 	var goodsIds []int32
 	var shopCarts []model.ShoppingCart
 	goodsNumsMap := make(map[int32]int32)
 
+	shopCartSpan := opentracing.GlobalTracer().StartSpan("select_ShopCart", opentracing.ChildOf(parentSpan.Context()))
 	if tx := global.DB.Where(&model.ShoppingCart{User: orderInfo.User, Checked: true}).Find(&shopCarts); tx.RowsAffected == 0 {
 		o.Code = codes.InvalidArgument
 		o.Detail = "没有选中结算的商品"
 		return primitive.RollbackMessageState
 	}
+	shopCartSpan.Finish()
 	for _, shopCart := range shopCarts {
 		goodsIds = append(goodsIds, shopCart.Goods)
 		goodsNumsMap[shopCart.Goods] = shopCart.Nums
 	}
 	//跨服务获取商品信息
+	queryGoodsSpan := opentracing.GlobalTracer().StartSpan("query_goods", opentracing.ChildOf(parentSpan.Context()))
+
 	goods, err := global.GoodsSrvClient.BatchGetGoods(context.Background(), &proto.BatchGoodsIdInfo{Id: goodsIds})
 	if err != nil {
 		o.Code = codes.InvalidArgument
 		o.Detail = "批量查询商品信息失败"
 		return primitive.RollbackMessageState
 	}
+	queryGoodsSpan.Finish()
 	var orderAmount float32
 	var orderGoods []*model.OrderGoods
 	var goodsInvInfo []*proto.GoodsInvInfo
@@ -189,11 +197,14 @@ func (o *OrderListener) ExecuteLocalTransaction(msg *primitive.Message) primitiv
 	}
 	//调用库存服务
 	//夸服务调用try
+	queryInvSpan := opentracing.GlobalTracer().StartSpan("query_inv", opentracing.ChildOf(parentSpan.Context()))
+
 	if _, err = global.InventorySrvClient.Sell(context.Background(), &proto.SellInfo{OrderSn: orderInfo.OrderSn, GoodsInfo: goodsInvInfo}); err != nil {
 		o.Code = codes.ResourceExhausted
 		o.Detail = "扣减库存失败"
 		return primitive.RollbackMessageState
 	}
+	queryInvSpan.Finish()
 	//o.Code = codes.Internal
 	//o.Detail = "本地事务执行失败"
 	//return primitive.UnknowState
@@ -201,6 +212,7 @@ func (o *OrderListener) ExecuteLocalTransaction(msg *primitive.Message) primitiv
 	//success := true
 	tx := global.DB.Begin()
 	orderInfo.OrderMount = orderAmount
+	saveOrderSpan := opentracing.GlobalTracer().StartSpan("save_oder", opentracing.ChildOf(parentSpan.Context()))
 
 	if result := tx.Save(&orderInfo); result.RowsAffected == 0 {
 		tx.Rollback()
@@ -208,6 +220,7 @@ func (o *OrderListener) ExecuteLocalTransaction(msg *primitive.Message) primitiv
 		o.Detail = "创建订单失败"
 		return primitive.CommitMessageState
 	}
+	saveOrderSpan.Finish()
 	o.OrderAmount = orderAmount
 	o.ID = orderInfo.ID
 
@@ -216,19 +229,25 @@ func (o *OrderListener) ExecuteLocalTransaction(msg *primitive.Message) primitiv
 
 	}
 	//批量插入
+	saveOrderGoodsSpan := opentracing.GlobalTracer().StartSpan("save_oder_goods", opentracing.ChildOf(parentSpan.Context()))
+
 	if result := tx.CreateInBatches(orderGoods, 100); result.RowsAffected == 0 {
 		tx.Rollback()
 		o.Code = codes.Internal
 		o.Detail = "批量插入订单商品失败"
 		return primitive.CommitMessageState
 	}
+	saveOrderGoodsSpan.Finish()
 	//清空购物车
+	deleteShopCartSpan := opentracing.GlobalTracer().StartSpan("delete_ShopCart", opentracing.ChildOf(parentSpan.Context()))
+
 	if result := tx.Where(&model.ShoppingCart{User: orderInfo.User, Checked: true}).Delete(&model.ShoppingCart{}); result.RowsAffected == 0 {
 		tx.Rollback()
 		o.Code = codes.Internal
 		o.Detail = "删除购物车记录失败"
 		return primitive.CommitMessageState
 	}
+	deleteShopCartSpan.Finish()
 	//发送延迟消息
 	p, err := rocketmq.NewProducer(producer.WithNameServer([]string{"192.168.11.130:9876"}))
 	if err != nil {
@@ -268,7 +287,8 @@ func (o *OrderListener) CheckLocalTransaction(msg *primitive.MessageExt) primiti
 	return primitive.RollbackMessageState
 }
 func (*OrderServer) CreateOrder(ctx context.Context, req *proto.OrderRequest) (*proto.OrderInfoResponse, error) {
-	orderListener := OrderListener{}
+
+	orderListener := OrderListener{Ctx: ctx}
 	p, err := rocketmq.NewTransactionProducer(
 		&orderListener,
 		producer.WithNameServer([]string{"192.168.11.130:9876"}),
